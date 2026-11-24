@@ -161,6 +161,12 @@ class DeviceHTTPServer(http.server.ThreadingHTTPServer):
                 try:
                     chunk = sock.recv(4096)
                     if chunk == b"":
+                        # 对端 FIN：证明值班台的取消操作真的把连接关掉了
+                        try:
+                            peer = str(sock.getpeername())
+                        except OSError:
+                            peer = ""
+                        self.device_state.record_stall_eof(self.stack_name, peer=peer)
                         return
                 except socket.timeout:
                     continue

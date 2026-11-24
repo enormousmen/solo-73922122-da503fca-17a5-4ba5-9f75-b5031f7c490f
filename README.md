@@ -10,11 +10,21 @@
 2. **250ms 并行窗口**：从操作开始计时，IPv6 在 250ms 内没有通过 TLS 证书校验，立即在旁并行启动 IPv4（`https://127.0.0.1:8443/reload`）。
 3. **提前失败立即切 IPv4**：IPv6 若在 250ms 内连接被拒/RST/证书校验失败，检测到终态后**立刻**启动 IPv4，不等满窗口。
 4. **同一设备名校验两路证书**：两路 TLS 都以 `server_hostname="switch-demo.local"` 做 SNI 与 hostname 校验，信任同一张内置 CA；证书 SAN 含该设备名、`localhost`、`127.0.0.1`、`::1`。设备名不匹配时两路都会被拒（有自测覆盖）。
-5. **最先通过者只发一次 POST**：证书校验通过后在同一把锁内原子选出唯一 winner，仅它在该连接上发送**一次** POST；另一路无论仍在握手还是已通过待选，都会被立即关闭释放。`parallel_delay=0` 的双路齐发用例连跑 15 次，计数始终为 1。
-6. **整次操作 3 秒上限**：默认 `deadline=3.0s`，到点关闭所有残留 socket。
+5. **最先通过者只发一次 POST，落败连接立刻真正关闭**：证书校验通过后在同一把锁内原子选出唯一 winner，仅它在该连接上发送**一次** POST。winner 选定的瞬间即对落败连接发起取消——**即使它的 TLS 握手还卡着、任何回执都还没到**。落败路若尚未建连，则四道门槛（建 socket 前 / connect 前 / TLS 握手前 / 握手后竞选）保证它之后**不再连设备、不报告证书校验通过**。
+6. **整次操作 3 秒上限**：默认 `deadline=3.0s`，到点对所有残留连接发起同样的取消并关闭。
 7. **未下发（`not_sent`）**：截止时 POST **尚未开始发送**（例如双路握手都卡住），标红“未下发”，设备计数不增加。
 8. **结果未知（`unknown`）且不重发**：一旦 POST **已经开始发送**，之后任何断连/超时/回执不完整都判定为“结果未知”，**不会**换另一路重发；设备侧共用计数最多 +1，可据此核对设备是否其实已执行。
-9. “是否已开始发送”与“截止/取消”在同一把锁下协调，消除“到点边界上误标状态”的竞态。
+9. **取消与“是否已开始发送”在同一把锁下协调**，消除“到点边界上误标状态”的竞态。
+
+#### 竞速取消的关键实现（修复“显示已释放、连接其实还开着”）
+
+旧实现对落败连接登记的是工作线程里的原始 socket；而 `ssl.SSLContext.wrap_socket()` 在 TLS 握手返回**之前**就会 `detach()` 原始 socket，使协调线程手里的对象变成无效 fd（`fileno() == -1`），对它调 `shutdown/close` 只会得到 `EBADF` 并被静默吞掉——于是界面记了“已释放”，真正的 fd 仍卡在握手里、连接一直 `ESTABLISHED`。现实现：
+
+- 每路登记连接时用 `os.dup()` 复制一个**独立的取消 fd**：与业务 fd 指向同一内核 socket file description，不受 `detach()` 影响；取消时用 `socket.socket(fileno=dup_fd)` 包一层发 `shutdown(SHUT_RDWR)`（随即 `detach()` 取回），可直接打断阻塞中的 connect / TLS 握手 / recv。
+- 时间线区分两个时刻：`loser_cancel_initiated`（发起取消）与 `loser_disconnected`（工作线程真正关闭 socket 后确认，含 `t_ms_actual`）；前端在时间线用红色徽标标出**落败连接实际断开的时机**，设备侧 stall 线程收到的 FIN 也记录在 `state.stall_eofs` 里，端到端证明连接真的断了。
+- 取消对“已关闭/正在关闭”的连接幂等：已释放的 dup fd 号可能被内核复用给后续连接，再次对它发 shutdown 会误伤 winner，因此 `close_claimed`/`closed`/`fd_released` 三重标志在锁内互斥，关闭权只能被一个线程认领。
+- connect 改为非阻塞 + `select` 轮询取消，SYN-SENT 阶段也能及时中断，并立即查 `SO_ERROR` 检出对端 RST。
+- 证书通过上报与 winner 竞选放在同一把锁内原子完成：落败路即使握手刚完成也不允许报告“证书校验通过”，立即判负关闭。
 
 ### 内置双栈样例设备（`app/device.py` + `app/state.py`）
 
@@ -22,7 +32,7 @@
 - `POST /reload`：在共用锁内递增**两路共用**的 `reload_count` 与分栈计数 `stack_count.{ipv6,ipv4}`，返回 JSON 回执（含新计数、实际服务栈、request_id、时间）。
 - 故障注入（可按栈分别设置）：
   - `ok`：正常 TLS + 回执；
-  - `stall`：accept TCP 后**卡住 TLS 握手**（不回 ServerHello），用于演示“IPv6 握手卡住”；
+  - `stall`：accept TCP 后**卡住 TLS 握手**（不回 ServerHello），用于演示“IPv6 握手卡住”；该线程 `recv` 到对端 FIN（即值班台真的关掉了落败连接）时会记录到共享状态的 `stall_eofs`。
   - `reset`：accept 后立即 RST，用于演示“IPv6 提前失败”。
 - `disconnect_after_execute`：计数 +1（设备已执行）后不发完整回执、直接 RST 断连，用于演示“设备执行后断连 → 结果未知”。
 - `GET /health` 设备栈探活。
@@ -34,7 +44,7 @@
   - 绿色“已下发，收到设备回执”+ 格式化回执 JSON；
   - 红色“未下发”；
   - 橙色“结果未知”。
-- winner 路径、总耗时、POST 是否已开始、逐毫秒**竞速时间线**（TCP、证书校验、250ms 窗口、winner、释放另一路、POST 开始/发出、回执/失败、3s 截止等），以及每路证书 CN/SAN/校验名与错误明细。
+- winner 路径、总耗时、POST 是否已开始、逐毫秒**竞速时间线**（TCP、证书校验、250ms 窗口、winner、对落败连接的“发起取消 → 实际断开”两个时刻、POST 开始/发出、回执/失败、3s 截止等）。落败连接**实际断开**的事件用红色 `● 已断开` 徽标与左强调线醒目标出，并注明实际断开毫秒时刻与原因；每路证书 CN/SAN/校验名、落败拦截阶段、连接关闭原因与错误明细也在结果区列出。
 - 演示控制面板：IPv6/IPv4 三态单选、执行后断连开关、五个一键场景按钮（双栈正常 / IPv6 卡住 / IPv6 提前失败 / 执行后断连 / 双路均不可用）、计数清零；状态每 2.5s 自动刷新。
 - 纯原生 HTML/CSS/JS，无外部 CDN/字体，离线可用。
 
@@ -90,7 +100,7 @@ python3 -m app.main
 | 操作 | 预期结果 |
 | --- | --- |
 | 默认设置直接点“重载交换机配置” | 约几十 ms 内 **IPv6 证书通过并胜出**，不启动 IPv4；绿色成功，共用计数 +1（IPv6 分计数 +1） |
-| 点场景“IPv6 握手卡住 → IPv4”再重载 | 时间线显示 `+250ms parallel_window_elapsed` 后启动 IPv4，IPv4 胜出并拿到回执；计数 +1（IPv4 +1，IPv6 +0） |
+| 点场景“IPv6 握手卡住 → IPv4”再重载 | 时间线显示 `+250ms parallel_window_elapsed` 后启动 IPv4，IPv4 胜出并拿到回执；winner 选定即对 IPv6 发起取消、几毫秒内出现红色 `● 已断开`（落败连接实际断开）；计数 +1（IPv4 +1，IPv6 +0），无残留连接 |
 | 点场景“IPv6 提前失败 → 立即 IPv4” | `start_path` 的 reason 为 `ipv6_early_failure`，通常几十 ms 内即启动 IPv4，**早于 250ms** |
 | 点场景“执行后断连 → 结果未知” | 橙色“结果未知”，`POST 已开始=是`，无回执；共用计数仍 +1，且等待后不出现第二次增加（无重发） |
 | 点场景“双路均不可用 → 未下发（3s）” | 约 **3000ms** 后红色“未下发”，`POST 已开始=否`、无 winner，计数不变 |
@@ -107,7 +117,7 @@ curl -s localhost:8080/api/state
 
 ## 自测
 
-自动化端到端测试会在临时目录生成证书、随机端口真实启动双栈 TLS 设备，共 **2 个测试类、11 个测试方法**：
+自动化端到端测试会在临时目录生成证书、随机端口真实启动双栈 TLS 设备，共 **2 个测试类、17 个测试方法**：
 
 ```bash
 python3 -m unittest discover -s tests -v
@@ -116,25 +126,36 @@ python3 -m unittest discover -s tests -v
 最近一次实测结果（构建沙箱内，Python 3.11.2 / Flask 3.1.3 / cryptography 50.0.2）：
 
 ```
-Ran 11 tests in 9.792s
+Ran 17 tests in 10.580s
 OK
 ```
 
-覆盖：正常 IPv6 胜出且只发一次 POST；IPv6 stall 后恰在 ~250ms 启动 IPv4 并由其成功；IPv6 RST 后以 ipv6_early_failure 立即启动 IPv4；执行后断连判 unknown 且计数只 +1；双 stall 耗满约 3.0s 判 not_sent；parallel_delay=0 双路齐发仍恰好一次 POST（该用例单独连跑 15 次全部通过）；错误设备名证书校验被拒判 not_sent；设置校验；Flask 首页/healthz/settings/reload/reset 路由。
+覆盖：正常 IPv6 胜出且只发一次 POST；IPv6 stall 后恰在 ~250ms 启动 IPv4 并由其成功；IPv6 RST 后以 ipv6_early_failure 立即启动 IPv4；执行后断连判 unknown 且计数只 +1；双 stall 耗满约 3.0s 判 not_sent；parallel_delay=0 双路齐发仍恰好一次 POST；错误设备名证书校验被拒判 not_sent；设置校验；Flask 首页/healthz/settings/reload/reset 路由。
+
+针对本次“竞速取消”缺陷另有 6 个专项回归：
+
+- `test_09`：stall 接管后时间线同时含 `loser_cancel_initiated` 与 `loser_disconnected`，**设备侧 `stall_eofs` 收到 IPv6 落败连接的 FIN**，`/proc/net` 无残留 ESTABLISHED；
+- `test_10`：大 parallel_delay 下 v4 全程不启动，无 TCP 连接、无证书结论、无失败；
+- `test_11`：双路齐发时落败路 `cert_passed` 必为 False（不允许报告证书通过）；
+- `test_12`：连续 5 次 stall 接管，每次零残留、计数恰好 +1（fd 不泄漏）；
+- `test_13`：时间线全量可 JSON 序列化，winner 收尾事件与落败断开事件不混用；
+- `test_14`：winner 选定后才被调度的工作线程在“建 socket 前”门槛被拦，不产生任何连接。
 
 此外已真实启动 `python -m app.main` 用 curl 验证全部 HTTP 场景，实测数据：
 
-- IPv6 卡住：`status=delivered winner=ipv4`，IPv4 启动于 `+252ms`，reason=`parallel_delay_250ms`；
-- 执行后断连：`status=unknown`，错误 `RemoteDisconnected: Remote end closed connection without response`，计数 1→2 且无重发；
-- 双路卡住：`status=not_sent`，`elapsed=3000ms`，curl 墙钟 `3.025s`，计数不变；
-- 恢复正常：`winner=ipv6`，证书 CN=`switch-demo.local`。
+- IPv6 卡住：`status=delivered winner=ipv4`，v4 启动于 `+252ms`，reason=`parallel_delay_250ms`；winner 在 `+256ms` 发起取消、落败 IPv6 在 `+257ms` **实际断开**，设备 `stall_eofs` 记录到来自 `::1` 的 FIN；
+- IPv6 提前失败：`+2ms` 检测失败、立即拉起 v4，`+6ms` v4 胜出；
+- 执行后断连：`status=unknown`，错误 `RemoteDisconnected: Remote end closed connection without response`，计数恰好 +1 且无重发；
+- 双路卡住：`status=not_sent`，`elapsed=3000ms`，curl 墙钟 `3.018s`，两路均在 `+3000ms` 以 reason=`deadline` 实际断开，残留 ESTABLISHED=0；
+- 恢复正常：`winner=ipv6`，证书 CN=`switch-demo.local`，v4 不启动。
 
-前端另用 jsdom 加载真实 `index.html` + `app.js` 并对接运行中的服务做了点击级回归：依次执行“IPv6 卡住 / 执行后断连 / 双路不可用 / 正常”四个场景，横幅 class、winner、POST 标志、计数、时间线行数、回执区块显隐全部符合预期，`neither` 场景渲染耗时 `elapsed=3000`，且**无任何 JS 报错**。`node --check app.js` 通过；JS 引用的 21 个元素 ID 与模板全部匹配；compose YAML 通过解析校验。
+前端用 jsdom 加载真实服务端渲染的 `index.html` + 真实 `app.js` 并对接运行中的服务做点击级回归：依次执行“IPv6 卡住 / 执行后断连 / 双路不可用 / 正常”四个场景，**21/21 断言通过、无任何 JS 报错**；其中断言了时间线红色 `● 已断开` 徽标、“落败连接实际断开”文案、`实际断开于 +Nms` 时刻、横幅 class、winner、POST 标志、计数、回执区块显隐，`neither` 场景墙钟约 3s。`node --check app.js` 通过；JS 引用的全部元素 ID 与模板匹配；compose YAML 通过解析校验。
 
 ## 未完成项 / 已知限制（如实说明）
 
-1. **本构建沙箱没有 docker / docker compose 可执行程序，也没有 `/var/run/docker.sock`**，因此 `docker compose up --build` 未能在交付前于本机实际跑过；已做的替代验证是：compose YAML 解析通过、Dockerfile 基于官方 `python:3.12-slim` 且依赖均有 manylinux wheel、同一 `python -m app.main` 入口在宿主机 Python 3.11 下端到端实测通过。Docker 构建/启动仍需在有 Docker 的环境执行一次确认。
-2. 沙箱网络下载 Chromium 仅约 17KB/s，未做成真实浏览器像素级截图核对；已用 jsdom 完成真实 DOM + 点击 + 接口的前端行为回归（无 JS 错误），外加 JS 语法检查与元素 ID 交叉核对。视觉排版未经过像素级确认。
+1. **本构建沙箱没有 docker / docker compose / podman 等任何容器运行时，也没有 `/var/run/docker.sock`**，因此 `docker compose up --build` 未能在交付前于本机实际跑过。已做的替代验证：compose YAML 解析通过、Dockerfile 基于官方 `python:3.12-slim` 且依赖（Flask、cryptography，均有 manylinux wheel）与当前版本一致、本次改动只用标准库（`os`/`select`/`errno`）未新增依赖、同一 `python -m app.main` 入口在宿主机 Python 3.11 下端到端实测通过（含 17 项单测 + curl 全场景 + jsdom 21 项断言）。Docker 构建/启动仍需在有 Docker 的环境执行一次确认。
+2. 沙箱网络很慢，未做成真实浏览器像素级截图核对；已用 jsdom 31 完成真实 DOM + 点击 + 接口的前端行为回归（无 JS 错误），外加 `node --check` 语法检查与元素 ID 交叉核对。视觉排版未经过像素级确认。
 3. Flask 使用自带开发服务器（`threaded=True`），面向单个值班员的演示/内网低频操作足够；未接 gunicorn，是为了保证“设备 + 控制台同进程、双栈端口与共用状态”只有一份。
 4. 样例设备与 CA/服务器证书均为演示用途、自动生成，**不要**用于真实网络设备或生产环境。
-5. 3 秒总时限以协调线程的 20ms 轮询 + socket 关闭实现，实测判定时刻约在 3.00–3.02s；非硬实时。
+5. 3 秒总时限以协调线程 20ms 轮询 + dup fd `shutdown` 实现，实测判定时刻约在 3.00–3.02s；非硬实时。落败连接从“发起取消”到“实际断开”实测约 1ms（同机回环）。
+6. 旧实例进程在沙箱里因命名空间权限无法 `kill`，最终验证改在干净端口（8090/8444）上启动最新代码完成；这是沙箱环境限制，不影响代码本身。

@@ -37,6 +37,8 @@ class DeviceState:
             "disconnect_after_execute": False,
         }
         self._history: deque[dict[str, Any]] = deque(maxlen=30)
+        # stall 握手期间收到对端 FIN（对端确实把连接关掉了）的观测记录
+        self._stall_eofs: deque[dict[str, Any]] = deque(maxlen=30)
 
     def get_mode(self, stack: str) -> str:
         with self._lock:
@@ -86,6 +88,22 @@ class DeviceState:
             self.reload_count = 0
             self.stack_count = {"ipv4": 0, "ipv6": 0}
             self._history.clear()
+            self._stall_eofs.clear()
+
+    def record_stall_eof(self, stack: str, peer: str = "") -> None:
+        """设备侧在 stall 握手中观测到对端关闭（recv 得到 EOF）时调用。
+
+        用来端到端证明：值班台对落败连接的“取消”确实让对端收到了 FIN，
+        而不是只在界面上把它标记为已释放。
+        """
+        with self._lock:
+            self._stall_eofs.append(
+                {"time": time.time(), "stack": stack, "peer": peer}
+            )
+
+    def stall_eofs(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return list(self._stall_eofs)
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
@@ -97,4 +115,5 @@ class DeviceState:
                 "mode_labels": dict(MODE_LABELS),
                 "uptime_s": round(time.time() - self.started_at, 1),
                 "history": list(reversed(self._history)),
+                "stall_eofs": list(self._stall_eofs),
             }

@@ -13,8 +13,10 @@
     ipv6_early_failure_detected: "检测到 IPv6 提前失败",
     parallel_window_elapsed: "250ms 窗口到点，IPv6 尚未通过",
     winner_selected: "成为胜出路径，发送唯一 POST",
-    other_path_released: "另一路连接已释放",
-    loser_released: "落败连接已释放（未发送）",
+    loser_cancel_initiated: "已对落败连接下发关闭指令（取消）",
+    loser_disconnected: "落败连接实际断开（对端已关闭）",
+    connection_closed: "胜出连接正常关闭",
+    path_blocked_before_connect: "落败路在建立前被拦截，未连接设备",
     post_started: "开始发送 POST",
     post_sent: "POST 字节已全部发出",
     receipt_received: "收到完整设备回执",
@@ -176,11 +178,20 @@
 
   function kindForEvent(ev) {
     if (ev === "cert_verified" || ev === "receipt_received" || ev === "winner_selected") return "ok";
+    if (ev === "loser_disconnected") return "cut";
     if (ev === "attempt_failed" || ev === "receipt_failed") return "bad";
     if (ev === "deadline_reached" || ev === "parallel_window_elapsed" ||
-        ev === "ipv6_early_failure_detected" || ev === "both_paths_failed_early") return "warn";
+        ev === "ipv6_early_failure_detected" || ev === "both_paths_failed_early" ||
+        ev === "loser_cancel_initiated" || ev === "path_blocked_before_connect") return "warn";
     return "";
   }
+
+  var REASON_LABELS = {
+    winner_selected: "另一路已胜出",
+    deadline: "3 秒总时限到点",
+    both_failed: "两路均失败后收尾",
+    post_done: "收发结束"
+  };
 
   function renderTimeline(events) {
     var wrap = $("timeline-wrap");
@@ -190,18 +201,26 @@
       var detailParts = [];
       ["reason", "error", "http_status", "handshake_ms", "cn", "bytes", "connect_ms"].forEach(function (k) {
         if (e[k] !== undefined && e[k] !== null) {
-          var v = typeof e[k] === "string" && e[k].length > 120 ? e[k].slice(0, 120) + "…" : e[k];
+          var v = k === "reason" && REASON_LABELS[e[k]] ? REASON_LABELS[e[k]] : e[k];
+          if (typeof v === "string" && v.length > 120) v = v.slice(0, 120) + "…";
           detailParts.push(k + "=" + v);
         }
       });
+      // 落败连接：同时显示“发起取消 → 实际断开”的真实时刻差
+      if (e.event === "loser_disconnected" && typeof e.t_ms_actual === "number") {
+        detailParts.unshift("实际断开于 +" + e.t_ms_actual + "ms");
+      }
       if (e.detail && typeof e.detail === "object") {
         // race_start 的大对象不展开
       }
+      var cutMark = e.event === "loser_disconnected"
+        ? "<span class='cut-badge' title='该连接此刻真正关闭（设备侧收到 FIN）'>● 已断开</span>"
+        : "";
       return "<li class='kind-" + kindForEvent(e.event) + "'>" +
         "<span class='t'>+" + e.t_ms + "ms</span>" +
         (e.stack ? "<span class='st st-" + e.stack + "'>" + e.stack + "</span>"
                  : "<span class='st st-system'>sys</span>") +
-        "<span class='ev'>" + escapeHtml(label) + "</span>" +
+        "<span class='ev'>" + escapeHtml(label) + "</span>" + cutMark +
         (detailParts.length ? "<span class='detail'>" + escapeHtml(detailParts.join(" · ")) + "</span>" : "") +
         "</li>";
     }).join("");
@@ -246,9 +265,16 @@
       var lines = [r.error, "", "各路径明细："];
       Object.keys(r.attempts).forEach(function (st) {
         var a = r.attempts[st];
-        lines.push("[" + st + "] cert_passed=" + a.cert_passed +
+        var line = "[" + st + "] cert_passed=" + a.cert_passed +
           " failed=" + a.failed + (a.error ? " error=" + a.error : "") +
-          (a.cert ? " cn=" + a.cert.subject_cn + " verified_against=" + a.cert.verified_against_name : ""));
+          (a.cert ? " cn=" + a.cert.subject_cn + " verified_against=" + a.cert.verified_against_name : "");
+        if (a.blocked) {
+          line += " | 落败拦截阶段=" + a.blocked_stage + "（" + (REASON_LABELS[a.blocked_reason] || a.blocked_reason) + "）";
+        }
+        if (a.close_reason) {
+          line += " | 连接关闭原因=" + (REASON_LABELS[a.close_reason] || a.close_reason);
+        }
+        lines.push(line);
       });
       $("error-text").textContent = lines.join("\n");
     } else {

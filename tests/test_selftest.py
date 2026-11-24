@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import json
 import socket
 import sys
 import tempfile
@@ -34,6 +35,24 @@ def free_tcp_port() -> int:
     port = s.getsockname()[1]
     s.close()
     return port
+
+
+def count_established_to_port(port: int) -> tuple[int, int]:
+    """统计本机与指定端口仍处于 ESTABLISHED 的 (v4 数, v6 数)。"""
+    needle = f":{port:04X}"
+
+    def read(path: str) -> int:
+        try:
+            lines = Path(path).read_text().splitlines()[1:]
+        except OSError:
+            return 0
+        return sum(
+            1
+            for line in lines
+            if line.split()[3] == "01" and line.split()[1].endswith(needle)
+        )
+
+    return read("/proc/net/tcp"), read("/proc/net/tcp6")
 
 
 class RaceScenarioTests(unittest.TestCase):
@@ -84,11 +103,17 @@ class RaceScenarioTests(unittest.TestCase):
         kwargs.update(kw)
         return ReloadRace(**kwargs).run().to_dict()
 
-    def find_event(self, result: dict, name: str) -> dict | None:
+    def find_event(self, result: dict, name: str, stack: str | None = None) -> dict | None:
         for e in result["timeline"]:
-            if e["event"] == name:
+            if e["event"] == name and (stack is None or e.get("stack") == stack):
                 return e
         return None
+
+    def assert_no_lingering(self) -> None:
+        # 竞速返回后，设备端口上不允许残留任何 ESTABLISHED 连接
+        time.sleep(0.05)
+        v4, v6 = count_established_to_port(self.device.port)
+        self.assertEqual((v4, v6), (0, 0), f"存在残留连接 v4={v4} v6={v6}")
 
     # -- tests ---------------------------------------------------------
 
@@ -105,6 +130,7 @@ class RaceScenarioTests(unittest.TestCase):
         self.assertEqual(snap["stack_count"]["ipv6"], 1)
         self.assertEqual(snap["stack_count"]["ipv4"], 0)
         self.assertIsNone(self.find_event(result, "start_path"))
+        self.assert_no_lingering()
 
     def test_02_ipv6_stall_starts_ipv4_after_250ms(self) -> None:
         self.state.update_settings({"ipv6_mode": MODE_STALL})
@@ -182,8 +208,15 @@ class RaceScenarioTests(unittest.TestCase):
         self.assertIn(result["winner"], (IPV6, IPV4))
         winner_event = self.find_event(result, "winner_selected")
         self.assertIsNotNone(winner_event)
-        released = [e for e in result["timeline"] if e["event"] == "other_path_released"]
-        self.assertEqual(len(released), 1)
+        # 新取消语义：一次发起取消 + 一次落败连接实际断开
+        initiated = [e for e in result["timeline"] if e["event"] == "loser_cancel_initiated"]
+        disconnected = [
+            e for e in result["timeline"]
+            if e["event"] == "loser_disconnected" and e.get("reason") == "winner_selected"
+        ]
+        self.assertEqual(len(initiated), 1)
+        self.assertEqual(len(disconnected), 1)
+        self.assertEqual(initiated[0]["stack"], disconnected[0]["stack"])
         snap = self.state.snapshot()
         self.assertEqual(snap["reload_count"], 1)
         self.assertEqual(sum(snap["stack_count"].values()), 1)
@@ -200,6 +233,126 @@ class RaceScenarioTests(unittest.TestCase):
     def test_08_settings_validation(self) -> None:
         with self.assertRaises(ValueError):
             self.state.update_settings({"ipv6_mode": "bogus"})
+
+    # ---------- 本次缺陷修复的专项回归 ----------
+
+    def test_09_stall_loser_socket_actually_closed_and_timeline_marked(self) -> None:
+        """IPv6 握手卡住、IPv4 胜出后：
+
+        1. 时间线必须同时记录“发起取消”和落败连接“实际断开”两个时刻；
+        2. 设备侧 stall 线程必须收到对端 FIN（证明连接真关，而非只改界面）；
+        3. /proc/net 里不允许残留 ESTABLISHED；
+        4. 实际断开只能发生在发起取消之后。
+        """
+        self.state.update_settings({"ipv6_mode": MODE_STALL})
+        result = self.run_race()
+        self.assertEqual(result["winner"], IPV4)
+
+        initiated = self.find_event(result, "loser_cancel_initiated", IPV6)
+        disconnected = self.find_event(result, "loser_disconnected", IPV6)
+        self.assertIsNotNone(initiated, "缺少落败取消事件")
+        self.assertIsNotNone(disconnected, "缺少落败连接实际断开事件")
+        self.assertEqual(initiated["reason"], "winner_selected")
+        self.assertEqual(disconnected["reason"], "winner_selected")
+        self.assertGreaterEqual(
+            disconnected["t_ms_actual"], initiated["t_ms"],
+            "实际断开时刻不应早于发起取消",
+        )
+
+        # 设备侧确实观测到了 FIN（给服务端 50ms 轮询一点余量）
+        deadline = time.monotonic() + 1.0
+        eofs = []
+        while time.monotonic() < deadline:
+            eofs = self.state.stall_eofs()
+            if any(e["stack"] == IPV6 for e in eofs):
+                break
+            time.sleep(0.03)
+        self.assertTrue(
+            any(e["stack"] == IPV6 for e in eofs),
+            f"设备侧未观测到 IPv6 落败连接的 FIN：{eofs}",
+        )
+        self.assert_no_lingering()
+
+    def test_10_loser_never_connected_does_not_connect_or_pass_cert(self) -> None:
+        """落败一路若尚未开始建连，之后也不能再连设备、不能报告证书校验通过。
+
+        IPv6 正常时几十 ms 内胜出；把 parallel_delay 拉到 2.5s，v4 在整个
+        竞速周期内根本不会被调度建连。
+        """
+        result = self.run_race(parallel_delay=2.5)
+        self.assertEqual(result["status"], "delivered", result.get("error"))
+        self.assertEqual(result["winner"], IPV6)
+        # v4 从未启动，自然没有 TCP 连接、没有证书结论、没有失败
+        self.assertIsNone(self.find_event(result, "start_path", IPV4))
+        self.assertIsNone(self.find_event(result, "tcp_connected", IPV4))
+        self.assertFalse(result["attempts"]["ipv4"]["cert_passed"])
+        self.assertFalse(result["attempts"]["ipv4"]["failed"])
+        self.assert_no_lingering()
+
+    def test_11_parallel_zero_loser_blocked_from_cert_report(self) -> None:
+        """双路齐发时落败路即使握手刚完成，也不允许报告证书校验通过。"""
+        result = self.run_race(parallel_delay=0.0)
+        self.assertEqual(result["status"], "delivered")
+        winner = result["winner"]
+        loser = IPV4 if winner == IPV6 else IPV6
+        self.assertTrue(result["attempts"][winner]["cert_passed"])
+        self.assertFalse(
+            result["attempts"][loser]["cert_passed"],
+            "落败路不允许报告证书校验通过",
+        )
+        self.assert_no_lingering()
+
+    def test_12_stall_scenario_repeated_no_fd_leak(self) -> None:
+        """连续 5 次 stall 接管，每次结束后都不得有残留连接、计数恰好 +1。"""
+        self.state.update_settings({"ipv6_mode": MODE_STALL})
+        for i in range(5):
+            result = self.run_race()
+            self.assertEqual(result["status"], "delivered", f"第 {i} 次: {result.get('error')}")
+            self.assertEqual(result["winner"], IPV4)
+            self.assert_no_lingering()
+        self.assertEqual(self.state.reload_count, 5)
+        self.assertEqual(self.state.stack_count["ipv4"], 5)
+        self.assertEqual(self.state.stack_count["ipv6"], 0)
+
+    def test_13_timeline_serializable_and_events_well_formed(self) -> None:
+        self.state.update_settings({"ipv6_mode": MODE_STALL})
+        result = self.run_race()
+        # 全部时间线事件必须可 JSON 序列化（前端直接消费）
+        encoded = json.dumps(result["timeline"], ensure_ascii=False)
+        self.assertIn("loser_disconnected", encoded)
+        for e in result["timeline"]:
+            self.assertIn("t_ms", e)
+            self.assertIn("event", e)
+        # winner 正常收尾事件与落败断开事件不能混用
+        self.assertIsNone(self.find_event(result, "loser_disconnected", IPV4))
+        self.assertIsNotNone(self.find_event(result, "connection_closed", IPV4))
+
+    def test_14_gate1_blocks_thread_that_starts_after_winner(self) -> None:
+        """门槛 1：工作线程在 winner 已选定后才被调度时，
+        连 socket 都不允许创建，attempts 必须标记 before_socket 拦截。"""
+        race = ReloadRace(
+            port=self.device.port,
+            ca_cert=self.certs["ca_cert"],
+            device_name="switch-demo.local",
+            parallel_delay=2.0,  # 协调线程不会主动拉起 v4
+        )
+        # 先让正常竞速跑完：v6 胜出，v4 从未启动
+        result = race.run().to_dict()
+        self.assertEqual(result["winner"], IPV6)
+        self.assertNotIn(IPV4, race._conns)
+
+        # 竞速结束后才调度 v4 工作线程：门槛 1 必须直接拦截，不产生任何连接
+        race._attempt(IPV4)
+        self.assertNotIn(IPV4, race._conns, "门槛 1 拦截时不得注册任何 socket")
+        blocked = race._blocked[IPV4]
+        self.assertEqual(blocked["stage"], "before_socket")
+        # 竞速结束后全局 _canceled 已置位，门槛优先报 deadline（语义仍是禁止建连）
+        self.assertIn(blocked["reason"], ("deadline", "winner_selected"))
+        # 该事件发生在 run() 返回之后，直接查内部时间线
+        names = [e["event"] for e in race._timeline if e.get("stack") == IPV4]
+        self.assertIn("path_blocked_before_connect", names)
+        self.assertNotIn("tcp_connected", names)
+        self.assert_no_lingering()
 
 
 class FlaskRouteTests(unittest.TestCase):
@@ -247,6 +400,11 @@ class FlaskRouteTests(unittest.TestCase):
         self.assertEqual(body["result"]["status"], "delivered")
         self.assertEqual(body["result"]["winner"], "ipv4")
         self.assertEqual(body["device"]["stack_count"]["ipv4"], 1)
+        # API 返回里必须带新的断开观测与落败断开事件
+        events = [e["event"] for e in body["result"]["timeline"]]
+        self.assertIn("loser_cancel_initiated", events)
+        self.assertIn("loser_disconnected", events)
+        self.assertIn("stall_eofs", body["device"])
 
     def test_api_reset_count(self) -> None:
         r = self.client.post("/api/reset-count")
