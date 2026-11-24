@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# 运行时自动生成的演示证书/密钥
+certs/*.pem
+certs/*.srl
+
+# 临时与系统文件
+.DS_Store
+/tmp/

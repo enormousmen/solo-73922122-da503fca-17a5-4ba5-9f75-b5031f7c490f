@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>交换机配置重载台 · 双栈 HTTPS</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">⇄</span>
+    <div>
+      <h1>交换机配置重载台</h1>
+      <p class="subtitle">IPv6 优先 · 250ms 未过证书校验则并行 IPv4 · 全程 3s 上限 · 同设备名校验</p>
+    </div>
+  </div>
+  <div class="device-meta">
+    <div><span class="dot dot-ok" id="health-dot"></span> 内置双栈样例设备</div>
+    <code>{{ device_name }}</code>
+    <div class="endpoints">
+      <span>IPv6 <code>https://[::1]:{{ device_port }}</code></span>
+      <span>IPv4 <code>https://127.0.0.1:{{ device_port }}</code></span>
+    </div>
+  </div>
+</header>
+
+<main class="layout">
+  <!-- 计数区 -->
+  <section class="stats">
+    <div class="stat stat-total">
+      <div class="stat-label">两路共用重载计数</div>
+      <div class="stat-value" id="count-total">–</div>
+      <div class="stat-foot">设备实际执行次数（IPv4/IPv6 同一计数器）</div>
+    </div>
+    <div class="stat">
+      <div class="stat-label">经 IPv6 下发</div>
+      <div class="stat-value v6" id="count-v6">–</div>
+      <div class="stat-foot">stack_count.ipv6</div>
+    </div>
+    <div class="stat">
+      <div class="stat-label">经 IPv4 下发</div>
+      <div class="stat-value v4" id="count-v4">–</div>
+      <div class="stat-foot">stack_count.ipv4</div>
+    </div>
+    <div class="stat">
+      <div class="stat-label">设备运行时长</div>
+      <div class="stat-value small" id="uptime">–</div>
+      <div class="stat-foot">sample device uptime</div>
+    </div>
+  </section>
+
+  <div class="grid-two">
+    <!-- 操作 + 结果 -->
+    <section class="card console-card">
+      <h2>重载操作</h2>
+      <button id="btn-reload" class="btn-reload">
+        <span class="btn-icon">↻</span>
+        <span class="btn-text">重载交换机配置</span>
+      </button>
+      <p class="hint" id="run-hint">点击后先连 IPv6；{{ parallel_delay_ms }}ms 内未通过证书校验即并行尝试 IPv4；整次操作最多 {{ deadline_ms/1000 }} 秒。</p>
+
+      <div id="result-banner" class="banner hidden"></div>
+
+      <div id="winner-row" class="winner-row hidden">
+        <span>胜出路径：<strong id="winner">–</strong></span>
+        <span>总耗时：<strong id="elapsed">–</strong> ms</span>
+        <span>POST 已开始：<strong id="post-started">–</strong></span>
+      </div>
+
+      <div id="receipt-wrap" class="receipt-wrap hidden">
+        <h3>设备回执</h3>
+        <pre id="receipt"></pre>
+      </div>
+
+      <div id="error-wrap" class="error-wrap hidden">
+        <h3>说明 / 错误</h3>
+        <pre id="error-text"></pre>
+      </div>
+
+      <div id="timeline-wrap" class="timeline-wrap hidden">
+        <h3>竞速时间线</h3>
+        <ol class="timeline" id="timeline"></ol>
+      </div>
+    </section>
+
+    <!-- 演示故障注入 -->
+    <section class="card demo-card">
+      <h2>演示场景注入</h2>
+
+      <fieldset class="mode-group" data-stack="ipv6">
+        <legend>IPv6 路径</legend>
+        <label class="mode-opt"><input type="radio" name="ipv6_mode" value="ok" checked> <span>正常</span></label>
+        <label class="mode-opt"><input type="radio" name="ipv6_mode" value="stall"> <span>握手卡住</span></label>
+        <label class="mode-opt"><input type="radio" name="ipv6_mode" value="reset"> <span>快速拒绝</span></label>
+        <p class="mode-explain" id="explain-ipv6"></p>
+      </fieldset>
+
+      <fieldset class="mode-group" data-stack="ipv4">
+        <legend>IPv4 路径（并行后启用）</legend>
+        <label class="mode-opt"><input type="radio" name="ipv4_mode" value="ok" checked> <span>正常</span></label>
+        <label class="mode-opt"><input type="radio" name="ipv4_mode" value="stall"> <span>握手卡住</span></label>
+        <label class="mode-opt"><input type="radio" name="ipv4_mode" value="reset"> <span>快速拒绝</span></label>
+        <p class="mode-explain" id="explain-ipv4"></p>
+      </fieldset>
+
+      <div class="toggle-row">
+        <label class="switch">
+          <input type="checkbox" id="disconnect">
+          <span class="slider"></span>
+        </label>
+        <div>
+          <strong>设备执行后断连</strong>
+          <p class="hint">计数先 +1（设备已执行），但不返回完整回执即断开；值班台应判“结果未知”，且不会换路重发，因此计数只 +1。</p>
+        </div>
+      </div>
+
+      <div class="scenario-buttons">
+        <button class="btn-ghost" data-scenario="normal">场景：双栈正常（IPv6 胜出）</button>
+        <button class="btn-ghost" data-scenario="v6stall">场景：IPv6 握手卡住 → IPv4</button>
+        <button class="btn-ghost" data-scenario="v6reset">场景：IPv6 提前失败 → 立即 IPv4</button>
+        <button class="btn-ghost" data-scenario="disconnect">场景：执行后断连 → 结果未知</button>
+        <button class="btn-ghost danger" data-scenario="neither">场景：双路均不可用 → 未下发（3s）</button>
+      </div>
+
+      <div class="reset-row">
+        <button id="btn-reset-count" class="btn-mini">计数清零</button>
+        <span id="settings-saved" class="saved-tip"></span>
+      </div>
+    </section>
+  </div>
+
+  <!-- 历史 -->
+  <section class="card history-card">
+    <h2>设备执行记录（来自共用状态）</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>#</th><th>时间 (UTC)</th><th>接收栈</th><th>request_id</th><th>注入断连</th></tr>
+        </thead>
+        <tbody id="history-body">
+          <tr><td colspan="5" class="empty">暂无重载记录</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <footer class="foot">
+    判定规则：截止前未开始 POST → <b class="tag-not_sent">未下发</b>；
+    POST 已开始但无完整回执 → <b class="tag-unknown">结果未知</b>（不重发）；
+    收到完整 JSON 回执 → <b class="tag-delivered">成功</b>。
+  </footer>
+</main>
+
+<script>
+  window.APP_CONFIG = {
+    parallelDelayMs: {{ parallel_delay_ms }},
+    deadlineMs: {{ deadline_ms }}
+  };
+</script>
+<script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
